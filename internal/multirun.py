@@ -40,7 +40,7 @@ def _forward_stdin(procs: List[Tuple[str, subprocess.Popen]]) -> None:
         line = sys.stdin.readline()
         if not line:
             break
-        for proc in procs:
+        for _, proc in procs:
             proc.stdin.write(line.encode())
             proc.stdin.flush()
 
