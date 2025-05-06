@@ -16,3 +16,9 @@ bzl_library(
     srcs = ["constants.bzl"],
     visibility = ["//:__pkg__"],
 )
+
+bzl_library(
+    name = "runfiles_enabled",
+    srcs = ["runfiles_enabled.bzl"],
+    visibility = ["//:__pkg__"],
+)

@@ -3,7 +3,7 @@ Multirun is a rule for running multiple commands in a single invocation. This
 can be very useful for something like running multiple linters or formatters
 in a single invocation.
 """
-
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 load("@bazel_skylib//lib:shell.bzl", "shell")
 load(
     "//internal:constants.bzl",
@@ -12,6 +12,10 @@ load(
     "rlocation_path",
     "update_attrs",
 )
+load("//internal:runfiles_enabled.bzl", "RunfilesEnabledProvider")
+
+_SH_TOOLCHAIN_TYPE = Label("@rules_shell//shell:toolchain_type")
+_RUNFILES_ENABLED_LABEL = Label("//:runfiles_enabled")
 
 _BinaryArgsEnvInfo = provider(
     fields = ["args", "env"],
@@ -44,6 +48,66 @@ def _binary_args_env_aspect_impl(target, ctx):
 _binary_args_env_aspect = aspect(
     implementation = _binary_args_env_aspect_impl,
 )
+
+
+_WINDOWS_EXECUTABLE_EXTENSIONS = [
+    "exe",
+    "cmd",
+    "bat",
+]
+
+def _is_windows_executable(file):
+    return file.extension in _WINDOWS_EXECUTABLE_EXTENSIONS
+
+def _create_windows_exe_launcher(ctx, sh_toolchain, primary_output):
+    if not sh_toolchain.launcher or not sh_toolchain.launcher_maker:
+        fail("Windows sh_toolchain requires both 'launcher' and 'launcher_maker' to be set")
+
+    bash_launcher = ctx.actions.declare_file(ctx.label.name + ".exe")
+
+    launch_info = ctx.actions.args().use_param_file("%s", use_always = True).set_param_file_format("multiline")
+    launch_info.add("binary_type=Bash")
+    launch_info.add(ctx.workspace_name, format = "workspace_name=%s")
+    launch_info.add("1" if ctx.attr._runfiles_enabled[RunfilesEnabledProvider].runfiles_enabled else "0", format = "symlink_runfiles_enabled=%s")
+    launch_info.add(sh_toolchain.path, format = "bash_bin_path=%s")
+    bash_file_short_path = primary_output.short_path
+    if bash_file_short_path.startswith("../"):
+        bash_file_rlocationpath = bash_file_short_path[3:]
+    else:
+        bash_file_rlocationpath = ctx.workspace_name + "/" + bash_file_short_path
+    launch_info.add(bash_file_rlocationpath, format = "bash_file_rlocationpath=%s")
+
+    launcher_artifact = sh_toolchain.launcher
+    ctx.actions.run(
+        executable = sh_toolchain.launcher_maker,
+        inputs = [launcher_artifact],
+        outputs = [bash_launcher],
+        arguments = [launcher_artifact.path, launch_info, bash_launcher.path],
+        use_default_shell_env = True,
+        toolchain = _SH_TOOLCHAIN_TYPE,
+    )
+    return bash_launcher
+
+def _launcher_for_windows(ctx, primary_output, main_file):
+    if _is_windows_executable(main_file):
+        if main_file.extension == primary_output.extension:
+            return primary_output
+        else:
+            fail("Source file is a Windows executable file, target name extension should match source file extension")
+
+    # bazel_tools should always registers a toolchain for Windows, but it may have an empty path.
+    sh_toolchain = ctx.toolchains[_SH_TOOLCHAIN_TYPE]
+    if not sh_toolchain or not sh_toolchain.path:
+        # Let fail print the toolchain type with an apparent repo name.
+        fail(
+            """No suitable shell toolchain found:
+* if you are running Bazel on Windows, set the BAZEL_SH environment variable to the path of bash.exe
+* if you are running Bazel on a non-Windows platform but are targeting Windows, register an sh_toolchain for the""",
+            _SH_TOOLCHAIN_TYPE,
+            "toolchain type",
+        )
+
+    return _create_windows_exe_launcher(ctx, sh_toolchain, primary_output)
 
 def _multirun_impl(ctx):
     instructions_file = ctx.actions.declare_file(ctx.label.name + ".json")
@@ -129,11 +193,22 @@ exec "$multirun_script" "$instructions" "$@"
         content = RUNFILES_PREFIX + script,
         is_executable = True,
     )
+
+    direct_files = [instructions_file, out_file]
+
+    
+    if ctx.target_platform_has_constraint(ctx.attr._windows_constraint[platform_common.ConstraintValueInfo]):
+        main_executable = _launcher_for_windows(ctx, out_file, out_file)
+        direct_files.append(main_executable)
+    else:
+        main_executable = out_file
+    
+    files = depset(direct=direct_files)
     return [
         DefaultInfo(
-            files = depset([out_file]),
-            runfiles = runfiles.merge(ctx.runfiles(files = runfiles_files + ctx.files.data)),
-            executable = out_file,
+            files = files,
+            runfiles = runfiles.merge(ctx.runfiles(transitive_files = files, files = runfiles_files + ctx.files.data, collect_default = True)),
+            executable = main_executable,
         ),
     ]
 
@@ -179,6 +254,13 @@ def multirun_with_transition(cfg, allowlist = None):
             default = False,
             doc = "Whether or not to forward stdin",
         ),
+        "_windows_constraint": attr.label(
+            default = "@platforms//os:windows",
+        ),
+        "_runfiles_enabled": attr.label(
+            default = _RUNFILES_ENABLED_LABEL,
+            providers = [RunfilesEnabledProvider],
+        ),
         "_bash_runfiles": attr.label(
             default = Label("@bazel_tools//tools/bash/runfiles"),
         ),
@@ -192,6 +274,9 @@ def multirun_with_transition(cfg, allowlist = None):
     return rule(
         implementation = _multirun_impl,
         attrs = update_attrs(attrs, cfg, allowlist),
+        toolchains = [
+            config_common.toolchain_type(_SH_TOOLCHAIN_TYPE, mandatory = False),
+        ],
         executable = True,
         doc = """\
 A multirun composes multiple command rules in order to run them in a single
